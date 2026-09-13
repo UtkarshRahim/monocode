@@ -2538,9 +2538,19 @@ fn git_diff_full_context(root: &Path, base: &str, head: &str) -> Result<(String,
     ensure_merge_base(root, base, head)?;
     let context = format!("-U{PR_FULL_CONTEXT_LINES}");
     let three_dot = format!("{base}...{head}");
-    let (bytes, truncated) =
-        git_output_capped(root, &["diff", &context, &three_dot], MAX_PR_DIFF_BYTES)
-            .ok_or_else(|| format!("git diff failed for {base}...{head}"))?;
+    let (bytes, truncated) = git_output_capped(
+        root,
+        &[
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--default-prefix",
+            &context,
+            &three_dot,
+        ],
+        MAX_PR_DIFF_BYTES,
+    )
+    .ok_or_else(|| format!("git diff failed for {base}...{head}"))?;
     if truncated {
         return Ok((String::new(), true));
     }
@@ -5714,6 +5724,60 @@ mod tests {
         assert!(
             !default.contains("line-1"),
             "default context should omit distant lines"
+        );
+    }
+
+    #[test]
+    fn git_diff_full_context_uses_canonical_plain_output() {
+        let dir = tmp("git-full-context-canonical");
+        if !init_git_commit(&dir.0, &[("file.txt", "alpha\n")]) {
+            return;
+        }
+        let base = git_run(&dir.0, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        std::fs::write(dir.0.join("file.txt"), "beta\n").unwrap();
+        if !git(&dir.0, &["add", "."]) || !git(&dir.0, &["commit", "-m", "edit"]) {
+            return;
+        }
+        let head = git_run(&dir.0, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let helper = dir.0.join("ext-diff.sh");
+        std::fs::write(&helper, "#!/bin/sh\necho EXTERNAL\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&helper, permissions).unwrap();
+        }
+        if !git(&dir.0, &["config", "color.ui", "always"])
+            || !git(&dir.0, &["config", "color.diff", "always"])
+            || !git(&dir.0, &["config", "diff.noprefix", "true"])
+            || !git(
+                &dir.0,
+                &["config", "diff.external", &helper.to_string_lossy()],
+            )
+        {
+            return;
+        }
+        let raw = git_run(&dir.0, &["diff", &format!("{base}...{head}")]).unwrap_or_default();
+        assert!(
+            raw.contains("EXTERNAL") || !raw.contains("diff --git a/file.txt b/file.txt"),
+            "hostile git settings should change a default diff:\n{raw}"
+        );
+        let (patch, truncated) = git_diff_full_context(&dir.0, &base, &head).unwrap();
+        assert!(!truncated);
+        assert!(
+            patch.contains("diff --git a/file.txt b/file.txt"),
+            "expected canonical prefixes:\n{patch}"
+        );
+        assert!(
+            !patch.contains('\u{1b}') && !patch.contains("EXTERNAL"),
+            "expected plain git diff output:\n{patch}"
         );
     }
 
